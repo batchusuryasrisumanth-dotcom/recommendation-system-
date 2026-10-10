@@ -1,0 +1,227 @@
+"""Ensemble recommender for a global e-commerce catalogue.
+
+Run:   python recsys.py        ->  builds dashboard.html (open it in a browser)
+Needs: pip install numpy pandas scikit-learn
+Real data (optional): put online_retail_II.csv (UCI, transactions from many
+countries) next to this file and run again. Otherwise a simulated world
+marketplace is used.
+"""
+import json, os
+import numpy as np, pandas as pd
+from pathlib import Path
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(7)
+K = 10
+REAL = "online_retail_II.csv"
+COLS = ["Popularity", "ItemKNN", "SVD", "Category", "Stacked ensemble"]
+
+# ---------------------------------------------------------------- data
+ADJ = ["Linen", "Copper", "Walnut", "Ceramic", "Woven", "Enamel", "Cotton", "Brass", "Oak", "Glass",
+       "Wool", "Bamboo", "Slate", "Painted", "Classic", "Vintage", "Folding", "Compact", "Handmade", "Striped"]
+NOUNS = {"Kitchen": ["Pan", "Jug", "Whisk"], "Garden": ["Trowel", "Planter", "Hose"],
+         "Stationery": ["Notebook", "Pen Set", "Planner"], "Toys": ["Puzzle", "Train Set", "Kite"],
+         "Lighting": ["Lamp", "Lantern", "Fairy Lights"], "Bags": ["Tote", "Backpack", "Pouch"],
+         "Home Decor": ["Vase", "Cushion", "Frame"], "Tea & Coffee": ["Teapot", "Grinder", "Mug"]}
+
+
+def make_world(n_users=3000, n_items=400):
+    countries = np.array(["India", "United Kingdom", "Germany", "Brazil", "Japan", "USA",
+                          "France", "Nigeria", "Australia", "Mexico", "Canada", "Spain"])
+    cats = np.array(list(NOUNS))
+    icat = rng.integers(0, len(cats), n_items)
+    names = [f"{rng.choice(ADJ)} {rng.choice(NOUNS[cats[c]])}" for c in icat]
+    w = np.array([14, 10, 8, 8, 7, 12, 6, 5, 6, 5, 6, 5], float)
+    uc = rng.choice(len(countries), n_users, p=w / w.sum())
+    UL, IL = rng.normal(size=(n_users, 6)), rng.normal(size=(n_items, 6))
+    CA = rng.normal(0, 1.1, (len(countries), len(cats)))      # each country likes different categories
+    logpop = rng.normal(0, 0.8, n_items)
+    rows = []
+    for u in range(n_users):
+        logit = 0.8 * IL @ UL[u] + CA[uc[u]][icat] + logpop
+        p = np.exp(logit - logit.max()); p /= p.sum()
+        for t, i in enumerate(rng.choice(n_items, 4 + rng.poisson(7), replace=False, p=p)):
+            rows.append((u, i, t))
+    return pd.DataFrame(rows, columns=["u", "i", "t"]), countries[uc], cats[icat], names
+
+
+def load_real(path, max_items=1500, max_users=4000):
+    d = pd.read_csv(path, encoding="latin1").rename(columns={"CustomerID": "Customer ID", "UnitPrice": "Price"})
+    d = d.dropna(subset=["Customer ID", "Description"])
+    d = d[(d.Quantity > 0) & (d.Price > 0)].copy()
+    d["t"] = pd.to_datetime(d.InvoiceDate)
+    d = d.sort_values("t").drop_duplicates(["Customer ID", "StockCode"])
+    d = d[d.StockCode.isin(d.StockCode.value_counts().index[:max_items])]
+    n = d.groupby("Customer ID").size()
+    d = d[d["Customer ID"].isin(n[n >= 5].index[:max_users])]
+    uid = {c: k for k, c in enumerate(d["Customer ID"].unique())}
+    iid = {c: k for k, c in enumerate(d.StockCode.unique())}
+    inter = pd.DataFrame({"u": d["Customer ID"].map(uid).values, "i": d.StockCode.map(iid).values, "t": d.t.values})
+    desc = d.groupby("StockCode").Description.first().str.title()
+    names = [desc[c] for c in iid]
+    last = pd.Series(names).str.split().str[-1].str.upper()      # crude category = last word of description
+    icat = np.where(last.isin(last.value_counts().index[:25]), last, "OTHER")
+    ctry = d.groupby("Customer ID").Country.agg(lambda s: s.mode()[0])
+    uc = pd.Series([ctry[c] for c in uid])
+    return inter, np.where(uc.isin(uc.value_counts().index[:12]), uc, "Other"), icat, names
+
+
+# ---------------------------------------------------------------- base models
+def fit_scores(M, ucountry, icat):
+    """Four different recommenders, each gives a (users x items) score matrix."""
+    pop = np.zeros_like(M)
+    for c in np.unique(ucountry):                       # 1. bestsellers inside the shopper's own country
+        m = ucountry == c
+        pop[m] = M[m].sum(0) + 0.1 * M.sum(0)
+    nrm = np.sqrt((M ** 2).sum(0)) + 1e-9               # 2. item-item cosine similarity ("bought together")
+    S = (M.T @ M) / np.outer(nrm, nrm); np.fill_diagonal(S, 0)
+    knn = M @ S
+    svd = TruncatedSVD(32, random_state=7)              # 3. latent taste factors
+    mf = svd.fit_transform(M) @ svd.components_
+    C = np.eye(icat.max() + 1, dtype=np.float32)[icat]  # 4. share of past purchases per category
+    prof = M @ C; prof /= prof.sum(1, keepdims=True) + 1e-9
+    cat = prof @ C.T + 0.001 * M.sum(0)
+    return {"Popularity": pop, "ItemKNN": knn, "SVD": mf, "Category": cat}
+
+
+def zs(S):
+    return {k: ((v - v.mean(1, keepdims=True)) / (v.std(1, keepdims=True) + 1e-9)).astype(np.float32) for k, v in S.items()}
+
+
+def candidates(S, blend, seen, topn=100):
+    s = np.where(seen > 0, -np.inf, blend)
+    cand = np.argsort(-s, 1)[:, :topn]
+    r = np.arange(len(s))[:, None]
+    return cand, np.stack([z[r, cand] for z in S.values()], -1)
+
+
+def metrics(score, seen, target):
+    s = np.where(seen > 0, -np.inf, score)
+    t = s[np.arange(len(s)), target][:, None]
+    rank = (s > t).sum(1) + ((s == t).sum(1) - 1) / 2   # ties split fairly
+    hit = rank < K
+    return hit, np.where(hit, 1 / np.log2(rank + 2), 0)
+
+
+# ---------------------------------------------------------------- experiment
+def main():
+    real = os.path.exists(REAL)
+    inter, ucountry, icat_s, names = load_real(REAL) if real else make_world()
+    source = "Online Retail II (real transactions)" if real else "simulated world marketplace"
+    inter = inter.sort_values(["u", "t"])
+    users = inter.u.unique()
+    inter["u"] = inter.u.map(pd.Series(range(len(users)), index=users))
+    ucountry = np.asarray(ucountry)[users]
+    _, icat = np.unique(icat_s, return_inverse=True)
+    nU, nI = len(users), len(names)
+
+    rk = inter.groupby("u").cumcount(ascending=False).values     # 0 = latest purchase
+
+    def mat(mask):
+        M = np.zeros((nU, nI), np.float32); s = inter[mask]; M[s.u.values, s.i.values] = 1; return M
+    Tr, Va, Te = mat(rk >= 2), mat(rk == 1), mat(rk == 0)
+    val_t, test_t = Va.argmax(1), Te.argmax(1)
+
+    # Stage 1: learn how much to trust each model (fit on train, label = validation purchase)
+    S = zs(fit_scores(Tr, ucountry, icat))
+    cand, X = candidates(S, np.mean(list(S.values()), 0), Tr)
+    clf = LogisticRegression(max_iter=1000).fit(X.reshape(-1, X.shape[-1]), (cand == val_t[:, None]).reshape(-1))
+
+    # Stage 2: refit models on train+validation, test on the hidden latest purchase
+    seen = Tr + Va
+    S2 = zs(fit_scores(seen, ucountry, icat))
+    blend = np.mean(list(S2.values()), 0)
+    cand, X = candidates(S2, blend, seen)
+    stacked = np.full((nU, nI), -np.inf, np.float32)
+    np.put_along_axis(stacked, cand, clf.decision_function(X.reshape(-1, X.shape[-1])).reshape(cand.shape), 1)
+    final = {**S2, "Equal-weight blend": blend, "Stacked ensemble": stacked}
+    res = {k: metrics(v, seen, test_t) for k, v in final.items()}
+
+    def table(groups):
+        return [dict(name=n, n=int(m.sum()), vals=[round(float(res[c][0][m].mean()), 3) for c in COLS])
+                for n, m in groups if m.sum() >= 5]
+    ntr = Tr.sum(1)
+    by_user = inter.groupby("u").i.apply(list)
+
+    def top(k, u):
+        s = np.where(seen[u] > 0, -np.inf, final[k][u])
+        return [[names[j], int(j == test_t[u])] for j in np.argsort(-s)[:10]]
+    demo = [dict(id=int(u), country=str(ucountry[u]), history=[names[j] for j in by_user[u][:-1][-6:]],
+                 next=names[test_t[u]], recs={c: top(c, u) for c in COLS})
+            for u in rng.choice(nU, 14, replace=False)]
+
+    out = dict(source=source, n_users=nU, n_items=nI, n_countries=int(len(set(ucountry))), cols=COLS,
+               models=[dict(name=k, hr=round(float(v[0].mean()), 4), ndcg=round(float(v[1].mean()), 4)) for k, v in res.items()],
+               weights=[dict(name=k, w=round(float(w), 3)) for k, w in zip(S, clf.coef_[0])],
+               by_country=table([(c, ucountry == c) for c in sorted(set(ucountry))]),
+               by_segment=table([("Light buyers (4 or fewer past purchases)", ntr <= 4),
+                                 ("Regular buyers (5 to 9)", (ntr >= 5) & (ntr <= 9)),
+                                 ("Heavy buyers (10+)", ntr >= 10)]),
+               demo=demo)
+    for m in out["models"]:
+        print(f"{m['name']:<20} HR@{K} {m['hr']:.3f}   NDCG@{K} {m['ndcg']:.3f}")
+    html = HTML.replace("__DATA__", json.dumps(out).replace("</", "<\\/"))
+    Path("dashboard.html").write_text(html, encoding="utf-8")
+    print("Wrote dashboard.html - open it in your browser.")
+
+
+HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Which product next? | Ensemble recommender study</title>
+<style>
+:root{--bg:#f3eee4;--ink:#2a2622;--mute:#7a6f63;--line:#d6cbb8;--acc:#a8432a;--hit:#f1d9b5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.6 Charter,"Iowan Old Style",Georgia,serif}
+main{max-width:940px;margin:auto;padding:0 22px 70px}
+header{padding:54px 0 24px;border-bottom:2px solid var(--ink)}
+.kicker{margin:0;font:600 12px/1 system-ui,sans-serif;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+h1{font-size:clamp(32px,6vw,52px);line-height:1.08;margin:.35em 0 .3em;letter-spacing:-.01em}
+.lede{max-width:62ch;margin:0 0 .8em}.by{font:13px system-ui,sans-serif;color:var(--mute);margin:0}
+section{padding:34px 0 8px;border-bottom:1px solid var(--line)}h2{font-size:24px;margin:0 0 .4em}
+.note,small,th,.stats span{font:13px/1.5 system-ui,sans-serif;color:var(--mute)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:22px;margin-bottom:14px}
+.stats b{display:block;font-size:44px;line-height:1.1;color:var(--acc)}
+.row{display:grid;grid-template-columns:230px 1fr 56px 90px;gap:12px;align-items:center;padding:7px 0;font-size:15px}
+.track{height:12px;background:#e6dcc9;border-radius:2px}.track i{display:block;height:100%;background:#8a7b68;border-radius:2px}
+.hi .track i{background:var(--acc)}.hi span{font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:15px;margin-bottom:24px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}td.best{font-weight:700;color:var(--acc)}
+.scroll{overflow-x:auto}select{font:inherit;padding:6px 8px;margin-left:8px;background:#fffaf0;border:1px solid var(--ink)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:18px;margin:16px 0}
+h4{font:600 13px system-ui,sans-serif;margin:0 0 6px}ol{margin:0;padding-left:22px;font-size:14px}li.hit{background:var(--hit);font-weight:700}
+footer{padding:28px 0;font-size:15px;color:var(--mute)}
+@media(max-width:640px){.row{grid-template-columns:1fr 50px}.row .track{grid-column:1/-1;order:3}.row small{display:none}}
+</style></head><body><main>
+<header><p class="kicker">Machine learning mini-project</p>
+<h1>Which product should we show a shopper next?</h1>
+<p class="lede" id="lede"></p>
+<p class="by">Prepared by [your name] &middot; Guided by [teacher's name] &middot; [college, year]</p></header>
+<section><h2>The short version</h2><div class="stats" id="stats"></div><p id="summary"></p></section>
+<section><h2>Model by model</h2><p class="note">Share of shoppers whose real next purchase appeared in the top 10 suggestions (hit rate). Higher is better.</p><div id="bars"></div></section>
+<section><h2>Who the ensemble listens to</h2><p class="note">Weights the stacking step learned for each model. A bigger number means the ensemble leans on that model more.</p><div id="weights"></div></section>
+<section><h2>Country by country</h2><p class="note">Hit rate @10. The best model in each row is highlighted.</p><div class="scroll"><table id="ctab"></table></div></section>
+<section><h2>Newcomers versus regulars</h2><p class="note">Shoppers with little history are the hard case for any recommender.</p><div class="scroll"><table id="stab"></table></div></section>
+<section><h2>See it for yourself</h2><label>Pick a shopper <select id="pick"></select></label><div id="shopper"></div></section>
+<footer><b>How it works.</b> Each shopper's latest purchase is hidden and used as the test. The purchase before it teaches the stacking step how much to trust each model, and everything earlier is the training history. Scores are standardised per shopper, the top 100 candidates from an equal blend are re-ranked by a logistic regression, and items already bought are never suggested.</footer>
+</main><script>
+const D=__DATA__,L={Popularity:"Bestsellers in their country",ItemKNN:"Bought together (item-KNN)",SVD:"Hidden taste (SVD)",Category:"Favourite categories","Equal-weight blend":"Equal-weight blend","Stacked ensemble":"Stacked ensemble"};
+const $=s=>document.querySelector(s),f=x=>x.toFixed(3),esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const M=D.models,st=M[M.length-1],bs=M.slice(0,4).reduce((a,b)=>a.hr>b.hr?a:b),lift=(st.hr/bs.hr-1)*100;
+$("#lede").textContent=`We hid each shopper's most recent purchase and asked four different recommenders, and then a combination of all four, to guess it. ${D.n_users.toLocaleString()} shoppers, ${D.n_items.toLocaleString()} products, ${D.n_countries} countries. Data: ${D.source}.`;
+$("#stats").innerHTML=[[f(st.hr),"hit rate @10, stacked ensemble"],[(lift>=0?"+":"")+lift.toFixed(0)+"%","vs the best single model ("+L[bs.name]+")"],[D.n_users.toLocaleString(),"shoppers tested"]].map(x=>`<div><b>${x[0]}</b><span>${x[1]}</span></div>`).join("");
+$("#summary").textContent=lift>0?"Combining the models beat every one of them on its own, because each one is strong where another is weak.":"In this run the ensemble did not beat the best single model. That is a result worth explaining, not hiding.";
+const mx=Math.max(...M.map(m=>m.hr));
+$("#bars").innerHTML=M.map(m=>`<div class="row${m===st?" hi":""}"><span>${L[m.name]}</span><div class="track"><i style="width:${m.hr/mx*100}%"></i></div><b>${f(m.hr)}</b><small>NDCG ${f(m.ndcg)}</small></div>`).join("");
+const wm=Math.max(...D.weights.map(w=>Math.abs(w.w)));
+$("#weights").innerHTML=D.weights.map(w=>`<div class="row"><span>${L[w.name]}</span><div class="track"><i style="width:${Math.abs(w.w)/wm*100}%"></i></div><b>${w.w.toFixed(2)}</b></div>`).join("");
+const tab=(id,rows,first)=>{$(id).innerHTML=`<tr><th>${first}</th><th>Shoppers</th>${D.cols.map(c=>`<th>${L[c]}</th>`).join("")}</tr>`+rows.map(r=>{const m=Math.max(...r.vals);return `<tr><td>${esc(r.name)}</td><td>${r.n}</td>${r.vals.map(v=>`<td class="${v==m?"best":""}">${f(v)}</td>`).join("")}</tr>`}).join("")};
+tab("#ctab",D.by_country,"Country");tab("#stab",D.by_segment,"Shopper type");
+$("#pick").innerHTML=D.demo.map((d,i)=>`<option value="${i}">Shopper ${d.id} (${esc(d.country)})</option>`).join("");
+const show=()=>{const d=D.demo[$("#pick").value];$("#shopper").innerHTML=`<p><b>Recently bought:</b> ${d.history.map(esc).join(" &middot; ")}</p><div class="cols">${D.cols.map(c=>`<div><h4>${L[c]}</h4><ol>${d.recs[c].map(r=>`<li class="${r[1]?"hit":""}">${esc(r[0])}</li>`).join("")}</ol></div>`).join("")}</div><p class="note">What they actually bought next: <b>${esc(d.next)}</b>. Highlighted wherever a model found it.</p>`};
+$("#pick").onchange=show;show();
+</script></body></html>
+"""
+
+if __name__ == "__main__":
+    main()
